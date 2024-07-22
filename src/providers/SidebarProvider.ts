@@ -3,7 +3,7 @@ import { Uri, Webview } from "vscode"
 import * as vscode from "vscode"
 import { ClaudeMessage, ExtensionMessage } from "../shared/ExtensionMessage"
 import { WebviewMessage } from "../shared/WebviewMessage"
-import { ClaudeDev } from "../ClaudeDev"
+import { GroqDev as ClaudeDev } from "../ClaudeDev"
 
 /*
 https://github.com/microsoft/vscode-webview-ui-toolkit-samples/blob/main/default/weather-webview/src/providers/WeatherViewProvider.ts

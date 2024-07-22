@@ -1,4 +1,5 @@
 import { Anthropic } from "@anthropic-ai/sdk"
+import Groq from "groq-sdk"
 import defaultShell from "default-shell"
 import * as diff from "diff"
 import { execa } from "execa"
@@ -16,6 +17,22 @@ import { ClaudeAskResponse } from "./shared/WebviewMessage"
 import { SidebarProvider } from "./providers/SidebarProvider"
 import { ClaudeRequestResult } from "./shared/ClaudeRequestResult"
 import os from "os"
+import { ChatCompletionTool } from "groq-sdk/resources/chat/completions.mjs"
+
+async function convertToolsToGroqFormat(anthropicTools: Tool[]): Promise<Array<ChatCompletionTool>> {
+	return anthropicTools.map(tool => ({
+		type: "function",
+		function: {
+			name: tool.name,
+			description: tool.description,
+			parameters: {
+				type: "object",
+				properties: tool.input_schema.properties,
+				required: tool.input_schema.required,
+			},
+		},
+	}));
+}
 
 const SYSTEM_PROMPT = `You are Claude Dev, a highly skilled software developer with extensive knowledge in many programming languages, frameworks, design patterns, and best practices.
 
@@ -641,4 +658,422 @@ export class ClaudeDev {
 			return { didCompleteTask: true, inputTokens: 0, outputTokens: 0 }
 		}
 	}
+}
+
+
+export class GroqDev {
+    private client: Groq;
+    private conversationHistory: Array<Groq.Chat.ChatCompletionMessageParam> = [
+		{role: 'system', content: SYSTEM_PROMPT}
+	];
+    private maxRequestsPerTask: number;
+    private requestCount = 0;
+    private askResponse?: ClaudeAskResponse;
+    private askResponseText?: string;
+    private providerRef: WeakRef<SidebarProvider>;
+    abort: boolean = false;
+
+    constructor(provider: SidebarProvider, task: string, apiKey: string, maxRequestsPerTask?: number) {
+        this.providerRef = new WeakRef(provider);
+        this.client = new Groq({ apiKey });
+        this.maxRequestsPerTask = maxRequestsPerTask ?? DEFAULT_MAX_REQUESTS_PER_TASK;
+
+        this.startTask(task);
+    }
+
+    updateApiKey(apiKey: string) {
+        this.client = new Groq({ apiKey });
+    }
+
+    updateMaxRequestsPerTask(maxRequestsPerTask: number | undefined) {
+        this.maxRequestsPerTask = maxRequestsPerTask ?? DEFAULT_MAX_REQUESTS_PER_TASK;
+    }
+
+    async handleWebviewAskResponse(askResponse: ClaudeAskResponse, text?: string) {
+        this.askResponse = askResponse;
+        this.askResponseText = text;
+    }
+
+    async ask(type: ClaudeAsk, question: string): Promise<{ response: ClaudeAskResponse; text?: string }> {
+        if (this.abort) {
+            throw new Error("GroqDev instance aborted");
+        }
+        this.askResponse = undefined;
+        this.askResponseText = undefined;
+        await this.providerRef.deref()?.addClaudeMessage({ ts: Date.now(), type: "ask", ask: type, text: question });
+        await this.providerRef.deref()?.postStateToWebview();
+        await pWaitFor(() => this.askResponse !== undefined, { interval: 100 });
+        const result = { response: this.askResponse!, text: this.askResponseText };
+        this.askResponse = undefined;
+        this.askResponseText = undefined;
+        return result;
+    }
+
+    async say(type: ClaudeSay, text: string): Promise<undefined> {
+        if (this.abort) {
+            throw new Error("GroqDev instance aborted");
+        }
+        await this.providerRef.deref()?.addClaudeMessage({ ts: Date.now(), type: "say", say: type, text: text });
+        await this.providerRef.deref()?.postStateToWebview();
+    }
+
+    private async startTask(task: string): Promise<void> {
+        await this.providerRef.deref()?.setClaudeMessages([]);
+        await this.providerRef.deref()?.postStateToWebview();
+
+        let userPrompt = `Task: "${task}"`;
+
+        await this.say("text", task);
+
+        let totalInputTokens = 0;
+        let totalOutputTokens = 0;
+
+        while (this.requestCount < this.maxRequestsPerTask) {
+            const { didCompleteTask, inputTokens, outputTokens } = await this.recursivelyMakeGroqRequests(userPrompt);
+            totalInputTokens += inputTokens;
+            totalOutputTokens += outputTokens;
+
+            if (didCompleteTask) {
+                break;
+            } else {
+                userPrompt = "Ask yourself if you have completed the user's task. If you have, use the attempt_completion tool, otherwise proceed to the next step. (This is an automated message, so do not respond to it conversationally. Just proceed with the task.)";
+            }
+        }
+    }
+
+	async executeTool(toolName: ToolName, toolInput: any): Promise<string> {
+		switch (toolName) {
+			case "write_to_file":
+				return this.writeToFile(toolInput.path, toolInput.content)
+			case "read_file":
+				return this.readFile(toolInput.path)
+			case "list_files":
+				return this.listFiles(toolInput.path)
+			case "execute_command":
+				return this.executeCommand(toolInput.command)
+			case "ask_followup_question":
+				return this.askFollowupQuestion(toolInput.question)
+			case "attempt_completion":
+				return this.attemptCompletion(toolInput.result, toolInput.command)
+			default:
+				return `Unknown tool: ${toolName}`
+		}
+	}
+
+	// Calculates cost of a Claude 3.5 Sonnet API request
+	calculateApiCost(inputTokens: number, outputTokens: number): number {
+		const INPUT_COST_PER_MILLION = 0.59 // $3 per million input tokens
+		const OUTPUT_COST_PER_MILLION = 0.79 // $15 per million output tokens
+		const inputCost = (inputTokens / 1_000_000) * INPUT_COST_PER_MILLION
+		const outputCost = (outputTokens / 1_000_000) * OUTPUT_COST_PER_MILLION
+		const totalCost = inputCost + outputCost
+		return totalCost
+	}
+
+	async writeToFile(filePath: string, newContent: string): Promise<string> {
+		try {
+			const fileExists = await fs
+				.access(filePath)
+				.then(() => true)
+				.catch(() => false)
+			if (fileExists) {
+				const originalContent = await fs.readFile(filePath, "utf-8")
+				const diffResult = diff.createPatch(filePath, originalContent, newContent)
+				// Create diff for DiffCodeView.tsx
+				const completeDiffStringRaw = diff.diffLines(originalContent, newContent)
+				const completeDiffStringConverted = completeDiffStringRaw
+					.map((part, index) => {
+						const prefix = part.added ? "+ " : part.removed ? "- " : "  "
+						return (part.value ?? [])
+							.split("\n")
+							.map((line, lineIndex) => {
+								// avoid adding an extra empty line at the very end of the diff output
+								if (
+									line === "" &&
+									index === completeDiffStringRaw.length - 1 &&
+									lineIndex === (part.value ?? []).split("\n").length - 1
+								) {
+									return null
+								}
+								return prefix + line + "\n"
+							})
+							.join("")
+					})
+					.join("")
+
+				const { response } = await this.ask(
+					"tool",
+					JSON.stringify({
+						tool: "editedExistingFile",
+						path: filePath,
+						diff: completeDiffStringConverted,
+					} as ClaudeSayTool)
+				)
+				if (response !== "yesButtonTapped") {
+					return "This operation was not approved by the user."
+				}
+
+				await fs.writeFile(filePath, newContent)
+				return `Changes applied to ${filePath}:\n${diffResult}`
+			} else {
+				const { response } = await this.ask(
+					"tool",
+					JSON.stringify({ tool: "newFileCreated", path: filePath, content: newContent } as ClaudeSayTool)
+				)
+				if (response !== "yesButtonTapped") {
+					return "This operation was not approved by the user."
+				}
+				await fs.mkdir(path.dirname(filePath), { recursive: true })
+				await fs.writeFile(filePath, newContent)
+				return `New file created and content written to ${filePath}`
+			}
+		} catch (error) {
+			const errorString = `Error writing file: ${JSON.stringify(serializeError(error))}`
+			this.say("error", `Error writing file:\n${error.message ?? JSON.stringify(serializeError(error), null, 2)}`)
+			return errorString
+		}
+	}
+
+	async readFile(filePath: string): Promise<string> {
+		try {
+			const content = await fs.readFile(filePath, "utf-8")
+			const { response } = await this.ask(
+				"tool",
+				JSON.stringify({ tool: "readFile", path: filePath, content } as ClaudeSayTool)
+			)
+			if (response !== "yesButtonTapped") {
+				return "This operation was not approved by the user."
+			}
+			return content
+		} catch (error) {
+			const errorString = `Error reading file: ${JSON.stringify(serializeError(error))}`
+			this.say("error", `Error reading file:\n${error.message ?? JSON.stringify(serializeError(error), null, 2)}`)
+			return errorString
+		}
+	}
+
+	async listFiles(dirPath: string, shouldLog: boolean = true): Promise<string> {
+		const absolutePath = path.resolve(dirPath)
+		const root = process.platform === "win32" ? path.parse(absolutePath).root : "/"
+		const isRoot = absolutePath === root
+		if (isRoot) {
+			if (shouldLog) {
+				const { response } = await this.ask(
+					"tool",
+					JSON.stringify({ tool: "listFiles", path: dirPath, content: root } as ClaudeSayTool)
+				)
+				if (response !== "yesButtonTapped") {
+					return "This operation was not approved by the user."
+				}
+			}
+			return root
+		}
+
+		try {
+			const options = {
+				cwd: dirPath,
+				dot: true, // Allow patterns to match files/directories that start with '.', even if the pattern does not start with '.'
+				mark: true, // Append a / on any directories matched
+			}
+			// * globs all files in one dir, ** globs files in nested directories
+			const entries = await glob("*", options)
+			const result = entries.slice(0, 500).join("\n") // truncate to 500 entries
+			if (shouldLog) {
+				const { response } = await this.ask(
+					"tool",
+					JSON.stringify({ tool: "listFiles", path: dirPath, content: result } as ClaudeSayTool)
+				)
+				if (response !== "yesButtonTapped") {
+					return "This operation was not approved by the user."
+				}
+			}
+			return result
+		} catch (error) {
+			const errorString = `Error listing files and directories: ${JSON.stringify(serializeError(error))}`
+			this.say(
+				"error",
+				`Error listing files and directories:\n${
+					error.message ?? JSON.stringify(serializeError(error), null, 2)
+				}`
+			)
+			return errorString
+		}
+	}
+
+	async executeCommand(command: string): Promise<string> {
+		const { response } = await this.ask("command", command)
+		if (response !== "yesButtonTapped") {
+			return "Command execution was not approved by the user."
+		}
+		try {
+			let result = ""
+			// execa by default tries to convery bash into javascript
+			// by using shell: true we use sh on unix or cmd.exe on windows
+			// also worth noting that execa`input` runs commands and the execa() creates a new instance
+			for await (const line of execa({ shell: true })`${command}`) {
+				this.say("command_output", line) // stream output to user in realtime
+				result += `${line}\n`
+			}
+			return `Command executed successfully. Output:\n${result}`
+		} catch (e) {
+			const error = e as any
+			let errorMessage = error.message || JSON.stringify(serializeError(error), null, 2)
+			const errorString = `Error executing command:\n${errorMessage}`
+			this.say("error", `Error executing command:\n${errorMessage}`) // TODO: in webview show code block for command errors
+			return errorString
+		}
+	}
+
+	async askFollowupQuestion(question: string): Promise<string> {
+		const { text } = await this.ask("followup", question)
+		await this.say("user_feedback", text ?? "")
+		return `User's response:\n\"${text}\"`
+	}
+
+	async attemptCompletion(result: string, command?: string): Promise<string> {
+		let resultToSend = result
+		if (command) {
+			await this.say("completion_result", resultToSend)
+			await this.executeCommand(command)
+			resultToSend = ""
+		}
+		const { response, text } = await this.ask("completion_result", resultToSend) // this prompts webview to show 'new task' button, and enable text input (which would be the 'text' here)
+		if (response === "yesButtonTapped") {
+			return ""
+		}
+		await this.say("user_feedback", text ?? "")
+		return `The user is not pleased with the results. Use the feedback they provided to successfully complete the task, and then attempt completion again.\nUser's feedback:\n\"${text}\"`
+	}
+
+    async recursivelyMakeGroqRequests(userContent: string): Promise<ClaudeRequestResult> {
+        if (this.abort) {
+            throw new Error("GroqDev instance aborted");
+        }
+
+        this.conversationHistory.push({ role: "user", content: userContent });
+        if (this.requestCount >= this.maxRequestsPerTask) {
+            const { response } = await this.ask(
+                "request_limit_reached",
+                `Groq Dev has reached the maximum number of requests for this task. Would you like to reset the count and allow it to proceed?`
+            );
+
+            if (response === "yesButtonTapped") {
+                this.requestCount = 0;
+            } else {
+                this.conversationHistory.push({
+                    role: "assistant",
+                    content: "Failure: I have reached the request limit for this task. Do you have a new task for me?",
+                });
+                return { didCompleteTask: true, inputTokens: 0, outputTokens: 0 };
+            }
+        }
+
+        try {
+            await this.say(
+                "api_req_started",
+                JSON.stringify({
+                    request: {
+                        model: "llama3-70b-8192",
+                        messages: [{ conversation_history: "..." }, { role: "user", content: userContent }],
+						system: "(see SYSTEM_PROMPT in https://github.com/saoudrizwan/claude-dev/src/ClaudeDev.ts)",
+                        max_tokens: 4096,
+                        temperature: 0.3,
+                        tools: "(see tools in https://github.com/saoudrizwan/claude-dev/src/ClaudeDev.ts)",
+						tool_choice: { type: 'auto' },
+                    },
+                })
+            );
+
+            const response = await this.client.chat.completions.create({
+                model: "llama3-70b-8192",
+                messages: this.conversationHistory,
+                temperature: 0.3,
+                tools: await convertToolsToGroqFormat(tools),
+                tool_choice: "auto",
+            });
+
+            this.requestCount++;
+
+            let assistantResponse = response.choices[0].message;
+            let inputTokens = response.usage?.prompt_tokens ?? 0;
+            let outputTokens = response.usage?.completion_tokens ?? 0;
+
+            await this.say(
+                "api_req_finished",
+                JSON.stringify({
+                    tokensIn: inputTokens,
+                    tokensOut: outputTokens,
+					cost: this.calculateApiCost(inputTokens, outputTokens),
+                })
+            );
+
+            let didCompleteTask = false;
+            let toolResults: any[] = [];
+
+            if (assistantResponse.content) {
+                await this.say("text", assistantResponse.content);
+                this.conversationHistory.push({ role: "assistant", content: assistantResponse.content });
+            }
+
+            if (assistantResponse.tool_calls) {
+                for (const toolCall of assistantResponse.tool_calls) {
+                    const toolName: any = toolCall.function.name; //TODO: type checking
+                    const toolInput = JSON.parse(toolCall.function.arguments);
+
+                    if (toolName === "attempt_completion") {
+                        const result = await this.attemptCompletion(toolInput.result, toolInput.command);
+                        if (result === "") {
+                            didCompleteTask = true;
+                            toolResults.push({
+                                tool_call_id: toolCall.id,
+                                role: "tool",
+                                name: toolName,
+                                content: "The user is satisfied with the result.",
+                            });
+                        } else {
+                            toolResults.push({
+                                tool_call_id: toolCall.id,
+                                role: "tool",
+                                name: toolName,
+                                content: result,
+                            });
+                        }
+                    } else {
+                        const result = await this.executeTool(toolName, toolInput);
+                        toolResults.push({
+                            tool_call_id: toolCall.id,
+                            role: "tool",
+                            name: toolName,
+                            content: result,
+                        });
+                    }
+                }
+            }
+
+            if (toolResults.length > 0) {
+                if (didCompleteTask) {
+                    this.conversationHistory.push(...toolResults);
+                    this.conversationHistory.push({
+                        role: "assistant",
+                        content: "I am pleased you are satisfied with the result. Do you have a new task for me?",
+                    });
+                } else {
+                    this.conversationHistory.push(...toolResults);
+                    const {
+                        didCompleteTask: recDidCompleteTask,
+                        inputTokens: recInputTokens,
+                        outputTokens: recOutputTokens,
+                    } = await this.recursivelyMakeGroqRequests("Continue with the task using the tool results provided.");
+                    didCompleteTask = recDidCompleteTask;
+                    inputTokens += recInputTokens;
+                    outputTokens += recOutputTokens;
+                }
+            }
+
+            return { didCompleteTask, inputTokens, outputTokens };
+        } catch (error) {
+            this.say("error", `API request failed:\n${error.message ?? JSON.stringify(serializeError(error), null, 2)}`);
+            return { didCompleteTask: true, inputTokens: 0, outputTokens: 0 };
+        }
+    }
 }
